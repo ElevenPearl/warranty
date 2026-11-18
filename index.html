@@ -127,6 +127,22 @@ nav b i{background:#fcfcfa;border:1px solid var(--ln)}nav b i img{height:24px;wi
 </style></head><body>
 <div class="app"><nav id="nav"></nav><main><div class="top"><input id="q" placeholder="🔍  Search customer, phone, invoice, product…" oninput="go('search')"><button class="p" onclick="saleForm()">+ Sale</button><button onclick="claimForm()">+ Claim</button></div><div id="v"></div></main></div>
 <div id="t"></div><div id="m" onclick="if(event.target.id=='m')cl()"><div id="mc"></div></div>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
+<script>
+const firebaseConfig = {
+  apiKey: "AIzaSyCmaaVJUgrq-RhQpWXTFsUnpWfCub8mkdg",
+  authDomain: "eleven-pearl-warranty.firebaseapp.com",
+  projectId: "eleven-pearl-warranty",
+  storageBucket: "eleven-pearl-warranty.firebasestorage.app",
+  messagingSenderId: "555836976920",
+  appId: "1:555836976920:web:59412e9d8e084d838df86d"
+};
+const firebaseApp = firebase.initializeApp(firebaseConfig);
+const cloudDB = firebaseApp.firestore();
+const CLOUD_COLLECTIONS = {C:'customers',S:'sales',W:'warranties',L:'claims',P:'products',DR:'drivers',CH:'chips'};
+let cloudReady=false, cloudBusy=false, cloudTimer=null, cloudListeners=[], cloudBaseline={}, cloudQueue=Promise.resolve();
+</script>
 <script>
 const K='ep_warranty_v1',DAY=864e5,T0=new Date().setHours(0,0,0,0);let D,page='dash',MO=false,SL=[],CW=null;
 const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -136,12 +152,89 @@ const dd=e=>Math.round((new Date(e).setHours(0,0,0,0)-T0)/DAY),bd=(t,c)=>`<span 
 const cu=id=>D.C.find(c=>c.id==id)||{name:'?'},wr=id=>D.W.find(w=>w.id==id)||{},pn=(c,n)=>(c?c+' ':'')+n,wl=m=>m==0?'No warranty':m>=12?m/12+' yr':m+' mo',wp=w=>pn(w.code,w.product),sum=(a,f)=>a.reduce((n,x)=>n+f(x),0);
 const items=s=>s.items.map(i=>i.q+' × '+esc(pn(i.code,i.name))+' ('+wl(i.wm)+')').join(', ');
 const claimed=id=>sum(D.L.filter(c=>c.wid==id),c=>c.n);
-function save(){try{localStorage.setItem(K,JSON.stringify(D))}catch(e){}}
+function save(){
+ try{localStorage.setItem(K,JSON.stringify(D))}catch(e){}
+ if(cloudReady){clearTimeout(cloudTimer);cloudTimer=setTimeout(()=>queueCloudSync(),700)}
+}
+function cloudRecords(k){return Array.isArray(D[k])?D[k]:[]}
+function cloudDocId(x){return String(x.id||'')}
+function queueCloudSync(){
+ if(!cloudReady)return;
+ cloudQueue=cloudQueue.then(()=>syncCloud()).catch(e=>{console.error('Firestore sync failed',e);toast('Cloud sync failed — data remains saved on this device')});
+}
+async function syncCloud(){
+ if(!cloudReady||cloudBusy)return;
+ cloudBusy=true;
+ try{
+  for(const [k,col] of Object.entries(CLOUD_COLLECTIONS)){
+   const current=cloudRecords(k), old=cloudBaseline[k]||{};
+   const now={}; current.forEach(x=>{if(x&&x.id)now[cloudDocId(x)]=x});
+   const ops=[];
+   for(const [id,obj] of Object.entries(now)){
+    if(!old[id]||JSON.stringify(old[id])!==JSON.stringify(obj))ops.push({type:'set',id,obj});
+   }
+   for(const id of Object.keys(old))if(!now[id])ops.push({type:'del',id});
+   for(let i=0;i<ops.length;i+=450){
+    const batch=cloudDB.batch();
+    ops.slice(i,i+450).forEach(op=>{const ref=cloudDB.collection(col).doc(op.id);op.type==='set'?batch.set(ref,op.obj):batch.delete(ref)});
+    await batch.commit();
+   }
+   cloudBaseline[k]=now;
+  }
+  await cloudDB.collection('app_meta').doc('main').set({n:D.n||{},updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
+ }finally{cloudBusy=false}
+}
+function cloudLocalHasData(x){return Object.values(CLOUD_COLLECTIONS).some(k=>Array.isArray(x[k])&&x[k].length>0)}
+function mergeRecords(local,remote){
+ const byId=new Map();(local||[]).forEach(x=>{if(x&&x.id)byId.set(String(x.id),x)});
+ (remote||[]).forEach(x=>{if(x&&x.id)byId.set(String(x.id),x)});
+ return [...byId.values()];
+}
+async function bootCloud(){
+ try{
+  let cloud={C:[],S:[],W:[],L:[],P:[],DR:[],CH:[],n:{}};
+  let cloudCount=0;
+  for(const [k,col] of Object.entries(CLOUD_COLLECTIONS)){
+   const snap=await cloudDB.collection(col).get();
+   cloud[k]=snap.docs.map(d=>d.data());cloudCount+=snap.size;
+  }
+  const meta=await cloudDB.collection('app_meta').doc('main').get();if(meta.exists)cloud.n=meta.data().n||{};
+  const local=D;
+  if(cloudCount===0&&cloudLocalHasData(local)){
+   // First connection: migrate the existing browser data into Firestore.
+   cloud=CLOUD_COLLECTIONS?{...cloud,...local}:cloud;
+   cloud.n=local.n||{};
+   D=cloud;cloudReady=true;await syncCloud();
+   toast('Existing data migrated to Firebase');
+  }else{
+   // Cloud data is authoritative, while local-only records are retained and uploaded.
+   for(const k of Object.keys(CLOUD_COLLECTIONS))D[k]=mergeRecords(local[k],cloud[k]);
+   D.n={...(cloud.n||{}),...(local.n||{})};cloudReady=true;await syncCloud();
+  }
+  try{localStorage.setItem(K,JSON.stringify(D))}catch(e){}
+  attachCloudListeners();draw();
+ }catch(e){console.error('Firebase initialization/load error',e);cloudReady=false;toast('Firebase unavailable — using local saved data')}
+}
+function attachCloudListeners(){
+ cloudListeners.forEach(unsub=>{try{unsub()}catch(e){}});cloudListeners=[];
+ for(const [k,col] of Object.entries(CLOUD_COLLECTIONS)){
+  const unsub=cloudDB.collection(col).onSnapshot(snap=>{
+   if(!cloudReady)return;
+   const arr=snap.docs.map(d=>d.data());
+   const incoming={};arr.forEach(x=>{if(x&&x.id)incoming[String(x.id)]=x});
+   cloudBaseline[k]=incoming;
+   D[k]=arr;
+   try{localStorage.setItem(K,JSON.stringify(D))}catch(e){}
+   draw();
+  },err=>console.error('Firestore listener',col,err));cloudListeners.push(unsub);
+ }
+ cloudListeners.push(cloudDB.collection('app_meta').doc('main').onSnapshot(doc=>{if(doc.exists&&doc.data().n){D.n=doc.data().n;try{localStorage.setItem(K,JSON.stringify(D))}catch(e){}}}));
+}
 function addSale(cid,inv,date,L,g){const id='s'+Date.now()+Math.random().toString(36).slice(2,5),sub=sum(L,l=>l.price*l.q*(1-(l.disc||0)/100)),gst=g.mode=='none'?0:sub*g.rate/100;
  D.S.push({id,inv,cid,date,items:L,gst:g,sub,tax:gst,total:sub+gst});
  L.forEach((l,i)=>{if(!l.wm)return;D.W.push({id:id+'w'+i,sid:id,inv,cid,code:l.code,product:l.name,desc:l.desc||'',qty:l.q,date,wm:l.wm,end:addM(date,l.wm),drv:l.drv,chip:l.chip});});return id}
 function mkc(w,n,issue){return{id:'cl'+Date.now()+Math.random().toString(36).slice(2,4),no:'CL-'+(1001+D.L.length),wid:w.id,cid:w.cid,inv:w.inv,product:wp(w),qty:w.qty,n,date:w.date,end:w.end,war:dd(w.end)>=0?'ACTIVE':'EXPIRED',days:dd(w.end),drv:w.drv,chip:w.chip,issue:issue||'',cdate:Date.now()}}
-function load(){try{D=JSON.parse(localStorage.getItem(K))}catch(e){}if(!D||!D.W)D={C:[],S:[],W:[],L:[],P:[],DR:[],CH:[],n:{}};D.DR=D.DR||[];D.CH=D.CH||[];D.P=(D.P||[]).map((p,i)=>({id:'p'+i+Date.now(),...p}))}
+function load(){try{D=JSON.parse(localStorage.getItem(K))}catch(e){}if(!D||!D.W)D={C:[],S:[],W:[],L:[],P:[],DR:[],CH:[],n:{}};D.DR=D.DR||[];D.CH=D.CH||[];D.P=(D.P||[]).map((p,i)=>({id:p.id||'p'+i+Date.now(),...p}));D.C=D.C||[];D.S=D.S||[];D.W=D.W||[];D.L=D.L||[];D.n=D.n||{}}
 function toast(m){const t=$('#t');t.textContent=m;t.className='on';setTimeout(()=>t.className='',2600)}
 function cl(){PEND=null;$('#m').style.display='none';if(MO){MO=false;try{history.replaceState({p:page},'')}catch(e){}}}
 function md(h){$('#mc').innerHTML=h;if(!MO){MO=true;try{history.pushState({m:1},'')}catch(e){}}$('#m').style.display='flex'}
@@ -229,5 +322,5 @@ function doClaim(){const w=wr(CW);if(!w.id)return toast('Select a warranty first
 /* search */
 function search(){const q=($('#q').value||'').trim().toLowerCase();if(!q)return '<h2>Search</h2><div class="sub">Type a customer, phone number, invoice or product name.</div>';const d=q.replace(/\D/g,''),C=D.C.filter(c=>[c.name,c.company,c.city,c.gst].some(x=>String(x||'').toLowerCase().includes(q))||(/^[\d\s+]+$/.test(q)&&d.length>=3&&String(c.phone||'').replace(/\D/g,'').includes(d))),W=D.W.filter(w=>mw(w,q)),L=D.L.filter(c=>mc(c,q)),S=D.S.filter(x=>[x.inv,cu(x.cid).name,...x.items.map(i=>pn(i.code,i.name))].some(t=>String(t).toLowerCase().includes(q)));
  return `<h2>Results for “${esc(q)}”</h2><h3>Customers (${C.length})</h3>${tbl(['Name','Phone','City'],C.map(c=>`<tr class="c" onclick="custView('${c.id}')"><td>${esc(c.name)}</td><td>${esc(c.phone)}</td><td>${esc(c.city)}</td></tr>`),'No customers match')}<h3>Invoices (${S.length})</h3>${tbl(['Invoice','Date','Customer','Total'],S.map(x=>`<tr class="c" onclick="invView('${x.inv}')"><td><b>${esc(x.inv)}</b></td><td>${dt(x.date)}</td><td>${esc(cu(x.cid).name)}</td><td>${inr(x.total)}</td></tr>`),'No invoices match')}<h3>Warranties (${W.length})</h3>${wtab(W)}<h3>Claims (${L.length})</h3>${ctabl(L)}`}
-load();try{history.replaceState({p:'dash'},'')}catch(e){}draw();
+load();try{history.replaceState({p:'dash'},'')}catch(e){}draw();bootCloud();
 </script></body></html>
